@@ -5,11 +5,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import SGD, lr_scheduler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from data.augmentations import get_transform
 from data.get_datasets import get_datasets, get_class_splits
+from data.data_utils import BinningDataSelector, BetaWeightingDataSelector, extract_features, weighted_loss
 
 from util.general_utils import AverageMeter, init_experiment
 from util.cluster_and_log_utils import log_accs_from_preds
@@ -30,7 +31,6 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
             eta_min=args.lr * 1e-3,
         )
 
-
     cluster_criterion = DistillLoss(
                         args.warmup_teacher_temp_epochs,
                         args.epochs,
@@ -39,12 +39,39 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                         args.teacher_temp,
                     )
 
-    # # inductive
-    # best_test_acc_lab = 0
-    # # transductive
-    # best_train_acc_lab = 0
-    # best_train_acc_ubl = 0 
-    # best_train_acc_all = 0
+    # Initialize data selectors if needed
+    binning_selector = None
+    beta_selector = None
+    if args.use_binning_selection:
+        binning_selector = BinningDataSelector(
+            num_clusters=args.num_clusters,
+            threshold_low=args.threshold_low,
+            threshold_high=args.threshold_high
+        )
+    elif args.use_beta_weighting:
+        beta_selector = BetaWeightingDataSelector(
+            alpha=args.beta_alpha,
+            beta_param=args.beta_beta
+        )
+
+    # Extract features for data selection if needed
+    if args.use_binning_selection or args.use_beta_weighting:
+        args.logger.info('Extracting features for data selection...')
+        with torch.no_grad():
+            labeled_features = extract_features(student.backbone, train_loader.dataset.labelled_dataset)
+            unlabeled_features = extract_features(student.backbone, train_loader.dataset.unlabelled_dataset)
+        
+        if args.use_binning_selection:
+            selected_indices = binning_selector.select_data(labeled_features, unlabeled_features)
+            train_loader.dataset.labelled_dataset = Subset(
+                train_loader.dataset.labelled_dataset, 
+                selected_indices.nonzero().squeeze().tolist()
+            )
+            args.logger.info(f'Selected {len(train_loader.dataset.labelled_dataset)} labeled samples using binning')
+        
+        elif args.use_beta_weighting:
+            weights = beta_selector.compute_weights(labeled_features, unlabeled_features)
+            args.logger.info('Computed beta distribution weights for labeled samples')
 
     for epoch in range(args.epochs):
         loss_record = AverageMeter()
@@ -89,8 +116,14 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
 
                 loss = 0
-                loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
-                loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
+                if args.use_beta_weighting:
+                    # Apply weights to supervised losses
+                    batch_weights = weights[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size].cuda()
+                    loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * weighted_loss(cls_loss, batch_weights)
+                    loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * weighted_loss(sup_con_loss, batch_weights)
+                else:
+                    loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
+                    loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
                 
             # Train acc
             loss_record.update(loss.item(), class_labels.size(0))
@@ -203,6 +236,15 @@ if __name__ == "__main__":
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--print_freq', default=10, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
+
+    # Data selection arguments
+    parser.add_argument('--use_binning_selection', action='store_true', help='Use binning-based data selection')
+    parser.add_argument('--use_beta_weighting', action='store_true', help='Use beta-distribution based weighting')
+    parser.add_argument('--num_clusters', type=int, default=10, help='Number of clusters for binning selection')
+    parser.add_argument('--threshold_low', type=float, default=0.2, help='Lower similarity threshold for binning')
+    parser.add_argument('--threshold_high', type=float, default=0.8, help='Upper similarity threshold for binning')
+    parser.add_argument('--beta_alpha', type=float, default=5.0, help='Alpha parameter for beta distribution')
+    parser.add_argument('--beta_beta', type=float, default=5.0, help='Beta parameter for beta distribution')
 
     # ----------------------
     # INIT

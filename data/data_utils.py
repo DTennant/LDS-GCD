@@ -1,5 +1,10 @@
 import numpy as np
 from torch.utils.data import Dataset
+import torch
+import torch.nn.functional as F
+from sklearn.cluster import KMeans
+from scipy.stats import beta
+from typing import Tuple, List, Optional
 
 def subsample_instances(dataset, prop_indices_to_subsample=0.8):
 
@@ -38,3 +43,86 @@ class MergedDataset(Dataset):
 
     def __len__(self):
         return len(self.unlabelled_dataset) + len(self.labelled_dataset)
+
+def extract_features(model: torch.nn.Module, dataset: Dataset, batch_size: int = 32) -> torch.Tensor:
+    """Extract features from a dataset using a pretrained model."""
+    model.eval()
+    features = []
+    
+    with torch.no_grad():
+        for i in range(0, len(dataset), batch_size):
+            batch_indices = range(i, min(i + batch_size, len(dataset)))
+            batch_images = torch.stack([dataset[idx][0] for idx in batch_indices])
+            batch_features = model(batch_images)
+            features.append(batch_features.cpu().detach())
+    
+    return torch.cat(features, dim=0)
+
+def cosine_similarity_matrix(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Compute cosine similarity between two sets of feature vectors."""
+    return F.cosine_similarity(A.unsqueeze(1), B.unsqueeze(0), dim=-1)
+
+class BinningDataSelector:
+    """Implements binning-based data selection for category discovery."""
+    
+    def __init__(self, 
+                 num_clusters: int = 10,
+                 threshold_low: float = 0.2,
+                 threshold_high: float = 0.8,
+                 random_state: int = 42):
+        self.num_clusters = num_clusters
+        self.threshold_low = threshold_low
+        self.threshold_high = threshold_high
+        self.random_state = random_state
+        self.kmeans = KMeans(n_clusters=num_clusters, random_state=random_state)
+    
+    def select_data(self, 
+                   labeled_features: torch.Tensor,
+                   unlabeled_features: torch.Tensor) -> torch.Tensor:
+        """Select labeled data based on similarity to unlabeled clusters."""
+        # Cluster unlabeled data
+        cluster_labels = self.kmeans.fit_predict(unlabeled_features.numpy())
+        
+        # Compute cluster means
+        cluster_means = torch.stack([
+            unlabeled_features[cluster_labels == i].mean(dim=0) 
+            for i in range(self.num_clusters)
+        ])
+        
+        # Compute similarity matrix
+        similarity_matrix = cosine_similarity_matrix(labeled_features, cluster_means)
+        
+        # Select samples based on similarity thresholds
+        max_similarities = similarity_matrix.max(dim=1).values
+        selected_indices = (max_similarities > self.threshold_low) & \
+                          (max_similarities < self.threshold_high)
+        
+        return selected_indices
+
+class BetaWeightingDataSelector:
+    """Implements beta-distribution based soft weighting for category discovery."""
+    
+    def __init__(self, alpha: float = 5.0, beta_param: float = 5.0):
+        self.alpha = alpha
+        self.beta_param = beta_param
+    
+    def compute_weights(self, 
+                       labeled_features: torch.Tensor,
+                       unlabeled_features: torch.Tensor) -> torch.Tensor:
+        """Compute weights for labeled data using beta distribution."""
+        # Compute similarity to farthest unlabeled point
+        similarities = cosine_similarity_matrix(labeled_features, unlabeled_features)
+        similarity_scores = similarities.min(dim=1).values
+        
+        # Convert to numpy for scipy compatibility
+        scores_np = similarity_scores.numpy()
+        
+        # Compute beta distribution weights
+        weights = beta.pdf(scores_np, self.alpha, self.beta_param)
+        weights = torch.tensor(weights / weights.max())  # Normalize to [0,1]
+        
+        return weights
+
+def weighted_loss(loss: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Apply weights to a loss tensor."""
+    return (loss * weights).mean()

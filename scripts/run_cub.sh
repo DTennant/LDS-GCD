@@ -19,4 +19,5 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --teacher_temp 0.04 \
     --warmup_teacher_temp_epochs 30 \
     --memax_weight 2 \
-    --exp_name cub_simgcd
+    --exp_name cub_simgcd \
+    --use_beta_weighting 

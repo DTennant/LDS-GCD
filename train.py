@@ -58,8 +58,8 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
     if args.use_binning_selection or args.use_beta_weighting:
         args.logger.info('Extracting features for data selection...')
         with torch.no_grad():
-            labeled_features = extract_features(student.backbone, train_loader.dataset.labelled_dataset)
-            unlabeled_features = extract_features(student.backbone, train_loader.dataset.unlabelled_dataset)
+            labeled_features, labeled_uq_idxs = extract_features(student[0], train_loader.dataset.labelled_dataset)
+            unlabeled_features, unlabeled_uq_idxs = extract_features(student[0], train_loader.dataset.unlabelled_dataset)
         
         if args.use_binning_selection:
             selected_indices = binning_selector.select_data(labeled_features, unlabeled_features)
@@ -71,6 +71,7 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
         
         elif args.use_beta_weighting:
             weights = beta_selector.compute_weights(labeled_features, unlabeled_features)
+            weights = weights.clamp(min=1e-2, max=1)
             args.logger.info('Computed beta distribution weights for labeled samples')
 
     for epoch in range(args.epochs):
@@ -81,6 +82,7 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
             images, class_labels, uq_idxs, mask_lab = batch
             mask_lab = mask_lab[:, 0]
 
+            uq_idxs = uq_idxs.cuda(non_blocking=True)
             class_labels, mask_lab = class_labels.cuda(non_blocking=True), mask_lab.cuda(non_blocking=True).bool()
             images = torch.cat(images, dim=0).cuda(non_blocking=True)
 
@@ -91,7 +93,7 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 # clustering, sup
                 sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
                 sup_labels = torch.cat([class_labels[mask_lab] for _ in range(2)], dim=0)
-                cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
+                cls_loss = nn.CrossEntropyLoss(reduction='mean' if not args.use_beta_weighting else 'none')(sup_logits, sup_labels)
 
                 # clustering, unsup
                 cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
@@ -109,21 +111,29 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 sup_con_labels = class_labels[mask_lab]
                 sup_con_loss = SupConLoss()(student_proj, labels=sup_con_labels)
 
-                pstr = ''
-                pstr += f'cls_loss: {cls_loss.item():.4f} '
-                pstr += f'cluster_loss: {cluster_loss.item():.4f} '
-                pstr += f'sup_con_loss: {sup_con_loss.item():.4f} '
-                pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
-
                 loss = 0
                 if args.use_beta_weighting:
-                    # Apply weights to supervised losses
-                    batch_weights = weights[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size].cuda()
+                    batch_weights = []
+                    for uq_idx in uq_idxs[mask_lab]:
+                        batch_weights.append(weights[labeled_uq_idxs.index(uq_idx.item())])
+                    batch_weights = torch.tensor(batch_weights).cuda()
+                    batch_weights = torch.cat([batch_weights for _ in range(2)], dim=0)
                     loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * weighted_loss(cls_loss, batch_weights)
-                    loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * weighted_loss(sup_con_loss, batch_weights)
+                    loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
                 else:
                     loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
                     loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
+
+                pstr = ''
+                if args.use_beta_weighting:
+                    with torch.no_grad():
+                        p_cls_loss = weighted_loss(cls_loss, batch_weights)
+                else:
+                    p_cls_loss = cls_loss
+                pstr += f'cls_loss: {p_cls_loss.item():.4f} '
+                pstr += f'cluster_loss: {cluster_loss.item():.4f} '
+                pstr += f'sup_con_loss: {sup_con_loss.item():.4f} '
+                pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
                 
             # Train acc
             loss_record.update(loss.item(), class_labels.size(0))
@@ -225,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--exp_root', type=str, default=exp_root)
     parser.add_argument('--transform', type=str, default='imagenet')
-    parser.add_argument('--sup_weight', type=float, default=0.35)
+    parser.add_argument('--sup_weight', type=float, default=1.0)
     parser.add_argument('--n_views', default=2, type=int)
     
     parser.add_argument('--memax_weight', type=float, default=2)

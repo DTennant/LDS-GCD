@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from scipy.stats import beta
+from tqdm import trange
 from typing import Tuple, List, Optional
 
 def subsample_instances(dataset, prop_indices_to_subsample=0.8):
@@ -48,15 +49,22 @@ def extract_features(model: torch.nn.Module, dataset: Dataset, batch_size: int =
     """Extract features from a dataset using a pretrained model."""
     model.eval()
     features = []
+    uq_idxs = []
     
+    # import ipdb; ipdb.set_trace()
     with torch.no_grad():
-        for i in range(0, len(dataset), batch_size):
+        for i in trange(0, len(dataset), batch_size):
             batch_indices = range(i, min(i + batch_size, len(dataset)))
-            batch_images = torch.stack([dataset[idx][0] for idx in batch_indices])
+            batch_images = []
+            batch_uq_idxs = []
+            for ind in batch_indices:
+                batch_images.append(dataset[ind][0][0])
+                uq_idxs.append(dataset[ind][2])
+            batch_images = torch.stack(batch_images).cuda()
             batch_features = model(batch_images)
             features.append(batch_features.cpu().detach())
     
-    return torch.cat(features, dim=0)
+    return torch.cat(features, dim=0), uq_idxs
 
 def cosine_similarity_matrix(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Compute cosine similarity between two sets of feature vectors."""
@@ -118,7 +126,8 @@ class BetaWeightingDataSelector:
         scores_np = similarity_scores.numpy()
         
         # Compute beta distribution weights
-        weights = beta.pdf(scores_np, self.alpha, self.beta_param)
+        rv = beta(self.alpha, self.beta_param)
+        weights = rv.pdf(scores_np,)
         weights = torch.tensor(weights / weights.max())  # Normalize to [0,1]
         
         return weights
